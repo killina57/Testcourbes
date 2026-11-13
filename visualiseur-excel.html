@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visualiseur de séries temporelles — Excel</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #171e2e;
+    --border: #2a3450;
+    --text: #e6ebf5;
+    --muted: #8b96ad;
+    --accent: #4f8ef7;
+    --c1: #ff7f0e;
+    --c2: #2ca02c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 8px 18px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 14px;
+    transition: border-color .2s, color .2s;
+  }
+  .dropzone:hover, .dropzone.dragover { border-color: var(--accent); color: var(--text); }
+  #fileInput { display: none; }
+  select, button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  label.toggle { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #fileName { font-size: 13px; color: var(--muted); }
+  #chart { width: 100%; height: 62vh; }
+  #statsPanel {
+    margin: 10px 20px 30px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    overflow-x: auto;
+  }
+  #statsPanel h2 {
+    font-size: 14px;
+    margin: 0 0 10px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  #statsPanel .hint { font-size: 13px; color: var(--muted); }
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th, td { padding: 6px 14px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  .cursor-chip {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+  }
+  #error {
+    display: none;
+    margin: 10px 20px;
+    padding: 10px 16px;
+    background: #3a1d24;
+    border: 1px solid #a33;
+    border-radius: 8px;
+    color: #ffb4b4;
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Visualiseur de séries temporelles</h1>
+  <div class="dropzone" id="dropzone">
+    Glissez un fichier <strong>.xlsx / .xls / .csv</strong> ici, ou cliquez pour parcourir
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+  </div>
+  <span id="fileName"></span>
+  <label class="toggle"><input type="checkbox" id="rangeSlider"> Curseur de période (rangeslider)</label>
+  <button id="resetCursors" title="Replace les curseurs aux positions initiales">Réinitialiser les curseurs</button>
+</header>
+
+<div id="error"></div>
+<div id="chart"></div>
+<div id="statsPanel">
+  <h2>Statistiques entre les curseurs</h2>
+  <div class="hint">Déplacez les curseurs verticaux en les faisant glisser avec la souris. Zoomez avec la molette, le pan (glisser) ou les outils de la barre d'outils. Double-clic pour réinitialiser le zoom.</div>
+  <div id="statsContent" style="margin-top:10px;"></div>
+</div>
+
+<script>
+const CURSOR_COLORS = ["#ff7f0e", "#2ca02c"];
+const gd = document.getElementById("chart");
+let workbook = null;
+let data = [];
+let seriesNames = [];
+let cursorDates = [null, null];
+let dragging = -1;
+
+const dropzone = document.getElementById("dropzone");
+const fileInput = document.getElementById("fileInput");
+const rangeSlider = document.getElementById("rangeSlider");
+
+dropzone.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", e => { if (e.target.files.length) loadFile(e.target.files[0]); });
+dropzone.addEventListener("dragover", e => { e.preventDefault(); dropzone.classList.add("dragover"); });
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  dropzone.classList.remove("dragover");
+  if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+});
+rangeSlider.addEventListener("change", () => {
+  if (!data.length) return;
+  Plotly.relayout(gd, { "xaxis.rangeslider.visible": rangeSlider.checked });
+});
+document.getElementById("resetCursors").addEventListener("click", () => {
+  if (!data.length) return;
+  placeCursorsAtDefaults();
+  redrawCursors();
+  updateStats();
+});
+
+function showError(msg) {
+  const el = document.getElementById("error");
+  el.textContent = msg;
+  el.style.display = "block";
+}
+function hideError() { document.getElementById("error").style.display = "none"; }
+
+function loadFile(file) {
+  hideError();
+  document.getElementById("fileName").textContent = " — " + file.name;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      workbook = XLSX.read(e.target.result, { type: "array", cellDates: true });
+      populateSheetSelector();
+      loadSheet(workbook.SheetNames[0]);
+    } catch (err) {
+      showError("Impossible de lire le fichier : " + err.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+let sheetSelect = null;
+function populateSheetSelector() {
+  const header = document.querySelector("header");
+  if (sheetSelect) sheetSelect.remove();
+  if (workbook.SheetNames.length < 2) return;
+  sheetSelect = document.createElement("select");
+  workbook.SheetNames.forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = "Feuille : " + name;
+    sheetSelect.appendChild(opt);
+  });
+  sheetSelect.addEventListener("change", () => loadSheet(sheetSelect.value));
+  header.insertBefore(sheetSelect, document.getElementById("fileName"));
+}
+
+function toISO(d) {
+  return d instanceof Date && !isNaN(d) ? d.toISOString() : null;
+}
+
+function parseDateValue(v) {
+  if (v instanceof Date) return isNaN(v) ? null : v;
+  if (typeof v === "number") return null;
+  if (typeof v === "string" && v.trim()) {
+    const d = new Date(v);
+    return isNaN(d) ? null : d;
+  }
+  return null;
+}
+
+function analyzeSheet(rows) {
+  if (!rows.length) return null;
+  const headers = Object.keys(rows[0]);
+  const scores = headers.map(h => {
+    let dates = 0, nums = 0, total = 0;
+    rows.forEach(r => {
+      const v = r[h];
+      if (v === undefined || v === null || v === "") return;
+      total++;
+      if (v instanceof Date || (typeof v === "string" && parseDateValue(v))) dates++;
+      else if (typeof v === "number") nums++;
+    });
+    return { h, dates, nums, total, dateRatio: total ? dates / total : 0 };
+  });
+  const dateCol = scores
+    .filter(s => s.dateRatio > 0.6)
+    .sort((a, b) => b.dateRatio - a.dateRatio || b.total - a.total)[0];
+  if (!dateCol) return null;
+  const valueCols = scores
+    .filter(s => s.h !== dateCol.h && s.total > 0 && s.nums / s.total > 0.6)
+    .map(s => s.h);
+  if (!valueCols.length) return null;
+  return { dateCol: dateCol.h, valueCols };
+}
+
+function loadSheet(sheetName) {
+  hideError();
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: null, raw: true });
+  const analysis = analyzeSheet(rows);
+  if (!analysis) {
+    showError("Aucune combinaison « colonne de dates + colonnes numériques » détectée dans cette feuille. Vérifiez que la première ligne contient les en-têtes.");
+    return;
+  }
+  data = [];
+  rows.forEach(r => {
+    const d = parseDateValue(r[analysis.dateCol]);
+    if (!d) return;
+    const point = { date: d };
+    let hasValue = false;
+    analysis.valueCols.forEach(c => {
+      const v = typeof r[c] === "number" ? r[c] : parseFloat(String(r[c]).replace(",", "."));
+      if (!isNaN(v)) { point[c] = v; hasValue = true; }
+    });
+    if (hasValue) data.push(point);
+  });
+  data.sort((a, b) => a.date - b.date);
+  if (!data.length) {
+    showError("Aucune ligne exploitable (date + valeur numérique) trouvée.");
+    return;
+  }
+  seriesNames = analysis.valueCols;
+  buildChart();
+}
+
+function buildChart() {
+  const traces = seriesNames.map(name => ({
+    x: data.map(p => p.date),
+    y: data.map(p => p[name] !== undefined ? p[name] : null),
+    name: name,
+    connectgaps: true,
+    type: "scatter",
+    mode: "lines"
+  }));
+  placeCursorsAtDefaults();
+  const layout = {
+    margin: { t: 20, r: 30, b: 60, l: 70 },
+    paper_bgcolor: "#0f1420",
+    plot_bgcolor: "#0f1420",
+    font: { color: "#e6ebf5" },
+    xaxis: {
+      title: { text: "Temps", standoff: 12 },
+      type: "date",
+      rangeslider: { visible: rangeSlider.checked, bgcolor: "#171e2e", bordercolor: "#2a3450" },
+      gridcolor: "#232c44",
+      zeroline: false
+    },
+    yaxis: {
+      title: { text: "Valeurs", standoff: 12 },
+      gridcolor: "#232c44",
+      zeroline: false,
+      fixedrange: false
+    },
+    legend: { orientation: "h", y: 1.08 },
+    hovermode: "x unified",
+    dragmode: "zoom",
+    shapes: cursorShapes(),
+    showlegend: true
+  };
+  const config = {
+    responsive: true,
+    scrollZoom: true,
+    displaylogo: false,
+    modeBarButtonsToRemove: ["select2d", "lasso2d"]
+  };
+  Plotly.newPlot(gd, traces, layout, config).then(() => {
+    attachCursorDrag();
+    updateStats();
+  });
+}
+
+function placeCursorsAtDefaults() {
+  const t0 = data[0].date.getTime();
+  const t1 = data[data.length - 1].date.getTime();
+  cursorDates = [new Date(t0 + (t1 - t0) * 0.25), new Date(t0 + (t1 - t0) * 0.75)];
+}
+
+function cursorShapes() {
+  return cursorDates.map((d, i) => ({
+    type: "line",
+    xref: "x",
+    yref: "paper",
+    x0: d,
+    x1: d,
+    y0: 0,
+    y1: 1,
+    layer: "above",
+    line: { color: CURSOR_COLORS[i], width: 2, dash: "dash" }
+  }));
+}
+
+function redrawCursors() {
+  const update = {};
+  cursorDates.forEach((d, i) => {
+    update["shapes[" + i + "].x0"] = d;
+    update["shapes[" + i + "].x1"] = d;
+  });
+  Plotly.relayout(gd, update);
+}
+
+function xaxisRef() { return gd._fullLayout.xaxis; }
+function pxToData(px) {
+  const xa = xaxisRef();
+  return xa.p2r(px - xa._offset);
+}
+function dataToPx(v) {
+  const xa = xaxisRef();
+  return xa.r2p(v) + xa._offset;
+}
+
+function attachCursorDrag() {
+  const svg = gd.querySelector(".main-svg");
+  svg.addEventListener("mousedown", onMouseDown);
+  window.addEventListener("mousemove", onMouseMove);
+  window.addEventListener("mouseup", () => { dragging = -1; });
+  svg.addEventListener("touchstart", onTouchStart, { passive: false });
+  window.addEventListener("touchmove", onTouchMove, { passive: false });
+  window.addEventListener("touchend", () => { dragging = -1; });
+}
+
+function cursorHitPx(clientX) {
+  const rect = gd.getBoundingClientRect();
+  const px = clientX - rect.left;
+  let best = -1, bestDist = 12;
+  cursorDates.forEach((d, i) => {
+    const dist = Math.abs(dataToPx(d.getTime()) - px);
+    if (dist < bestDist) { bestDist = dist; best = i; }
+  });
+  return best;
+}
+
+function setCursorFromClientX(clientX) {
+  const v = pxToData(clientX - gd.getBoundingClientRect().left);
+  if (v === undefined || v === null || isNaN(v)) return;
+  cursorDates[dragging] = new Date(v);
+  redrawCursors();
+  updateStats();
+}
+
+function onMouseDown(e) {
+  if (e.button !== 0) return;
+  dragging = cursorHitPx(e.clientX);
+  if (dragging >= 0) e.preventDefault();
+}
+function onMouseMove(e) {
+  if (dragging < 0) return;
+  setCursorFromClientX(e.clientX);
+}
+function onTouchStart(e) {
+  if (e.touches.length !== 1) return;
+  dragging = cursorHitPx(e.touches[0].clientX);
+  if (dragging >= 0) e.preventDefault();
+}
+function onTouchMove(e) {
+  if (dragging < 0 || e.touches.length !== 1) return;
+  e.preventDefault();
+  setCursorFromClientX(e.touches[0].clientX);
+}
+
+function fmt(d) {
+  return d.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+}
+function fmtNum(v) {
+  if (Math.abs(v) >= 1e6 || (Math.abs(v) < 1e-4 && v !== 0)) return v.toExponential(3);
+  return v.toLocaleString("fr-FR", { maximumFractionDigits: 4 });
+}
+
+function updateStats() {
+  const [c1, c2] = cursorDates;
+  const lo = c1 < c2 ? c1 : c2;
+  const hi = c1 < c2 ? c2 : c1;
+  const inRange = data.filter(p => p.date >= lo && p.date <= hi);
+  const deltaMs = hi - lo;
+  const deltaLabel =
+    deltaMs < 60000 ? fmtNum(deltaMs / 1000) + " s" :
+    deltaMs < 3600000 ? fmtNum(deltaMs / 60000) + " min" :
+    deltaMs < 86400000 ? fmtNum(deltaMs / 3600000) + " h" :
+    fmtNum(deltaMs / 86400000) + " jours";
+
+  let html = "<table><tr><th>Série</th><th>Points</th><th>Moyenne</th><th>Min</th><th>Max</th><th>Écart-type</th></tr>";
+  seriesNames.forEach(name => {
+    const vals = inRange.map(p => p[name]).filter(v => v !== undefined);
+    if (!vals.length) {
+      html += "<tr><td>" + name + "</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>";
+      return;
+    }
+    const n = vals.length;
+    const mean = vals.reduce((a, b) => a + b, 0) / n;
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n);
+    html += "<tr><td>" + name + "</td><td>" + n + "</td><td>" + fmtNum(mean) + "</td><td>" +
+            fmtNum(min) + "</td><td>" + fmtNum(max) + "</td><td>" + fmtNum(sd) + "</td></tr>";
+  });
+  html += "</table>";
+  html += "<div class='hint' style='margin-top:8px;'>" +
+    "<span class='cursor-chip' style='background:" + CURSOR_COLORS[0] + "'></span>" + fmt(cursorDates[0]) +
+    " &nbsp;→&nbsp; <span class='cursor-chip' style='background:" + CURSOR_COLORS[1] + "'></span>" + fmt(cursorDates[1]) +
+    " &nbsp;·&nbsp; Durée : " + deltaLabel + " &nbsp;·&nbsp; " + inRange.length + " point(s)</div>";
+  document.getElementById("statsContent").innerHTML = html;
+}
+</script>
+</body>
+</html>
